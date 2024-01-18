@@ -6,6 +6,8 @@ use {
   tokio::sync::mpsc::{error::TryRecvError, Receiver, Sender},
 };
 
+use std::fs::File;
+
 mod inscription_updater;
 
 pub(crate) struct BlockData {
@@ -320,6 +322,13 @@ impl<'index> Updater<'_> {
     block: BlockData,
     value_cache: &mut HashMap<OutPoint, u64>,
   ) -> Result<()> {
+    lazy_static! {
+      static ref LOG_FILE: File = File::options().append(true).open("log_file_index.txt").unwrap();
+    }
+    println!("cmd;{0};new_block;{1}", self.height, &block.header.block_hash());
+    writeln!(&*LOG_FILE, "cmd;{0};new_block;{1}", self.height, &block.header.block_hash())?;
+    (&*LOG_FILE).flush()?;
+    
     Reorg::detect_reorg(&block, self.height, self.index)?;
 
     let start = Instant::now();
@@ -385,6 +394,8 @@ impl<'index> Updater<'_> {
     let mut inscription_id_to_satpoint = wtx.open_table(INSCRIPTION_ID_TO_SATPOINT)?;
     let mut inscription_number_to_inscription_id =
       wtx.open_table(INSCRIPTION_NUMBER_TO_INSCRIPTION_ID)?;
+    let mut inscription_id_to_txcnt =
+      wtx.open_table(INSCRIPTION_ID_TO_TXCNT)?;
     let mut reinscription_id_to_seq_num = wtx.open_table(REINSCRIPTION_ID_TO_SEQUENCE_NUMBER)?;
     let mut sat_to_inscription_id = wtx.open_multimap_table(SAT_TO_INSCRIPTION_ID)?;
     let mut inscription_id_to_children = wtx.open_multimap_table(INSCRIPTION_ID_TO_CHILDREN)?;
@@ -409,6 +420,7 @@ impl<'index> Updater<'_> {
       &mut inscription_id_to_inscription_entry,
       lost_sats,
       &mut inscription_number_to_inscription_id,
+      &mut inscription_id_to_txcnt,
       &mut outpoint_to_value,
       &mut reinscription_id_to_seq_num,
       &mut sat_to_inscription_id,
@@ -512,6 +524,7 @@ impl<'index> Updater<'_> {
       for (tx, txid) in block.txdata.iter().skip(1).chain(block.txdata.first()) {
         inscription_updater.index_transaction_inscriptions(tx, *txid, None)?;
       }
+      inscription_updater.end_block()?;
     }
 
     self.index_block_inscription_numbers(

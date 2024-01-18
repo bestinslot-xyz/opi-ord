@@ -30,14 +30,15 @@ pub(crate) struct InscriptionEntry {
   pub(crate) parent: Option<InscriptionId>,
   pub(crate) sat: Option<Sat>,
   pub(crate) timestamp: u32,
+  pub(crate) is_json_or_text: bool,
 }
 
-pub(crate) type InscriptionEntryValue = (u64, u64, i64, ParentValue, u64, u32);
+pub(crate) type InscriptionEntryValue = (u64, u64, i64, ParentValue, u64, u32, i8);
 
 impl Entry for InscriptionEntry {
   type Value = InscriptionEntryValue;
 
-  fn load((fee, height, number, parent, sat, timestamp): InscriptionEntryValue) -> Self {
+  fn load((fee, height, number, parent, sat, timestamp, is_json_or_text): InscriptionEntryValue) -> Self {
     Self {
       fee,
       height,
@@ -49,6 +50,7 @@ impl Entry for InscriptionEntry {
         Some(Sat(sat))
       },
       timestamp,
+      is_json_or_text: is_json_or_text != 0,
     }
   }
 
@@ -63,6 +65,7 @@ impl Entry for InscriptionEntry {
         None => u64::MAX,
       },
       self.timestamp,
+      if self.is_json_or_text { 1 } else { 0 },
     )
   }
 }
