@@ -6,6 +6,8 @@ use {
   tokio::sync::mpsc::{error::TryRecvError, Receiver, Sender},
 };
 
+use std::fs::File;
+
 mod inscription_updater;
 mod rune_updater;
 
@@ -319,6 +321,13 @@ impl<'index> Updater<'_> {
     block: BlockData,
     value_cache: &mut HashMap<OutPoint, u64>,
   ) -> Result<()> {
+    lazy_static! {
+      static ref LOG_FILE: File = File::options().append(true).open("log_file_index.txt").unwrap();
+    }
+    println!("cmd;{0};new_block;{1}", self.height, &block.header.block_hash());
+    writeln!(&*LOG_FILE, "cmd;{0};new_block;{1}", self.height, &block.header.block_hash())?;
+    (&*LOG_FILE).flush()?;
+    
     Reorg::detect_reorg(&block, self.height, self.index)?;
 
     let start = Instant::now();
@@ -384,6 +393,8 @@ impl<'index> Updater<'_> {
       wtx.open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?;
     let mut inscription_number_to_sequence_number =
       wtx.open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)?;
+    let mut inscription_id_to_txcnt =
+      wtx.open_table(INSCRIPTION_ID_TO_TXCNT)?;
     let mut sat_to_sequence_number = wtx.open_multimap_table(SAT_TO_SEQUENCE_NUMBER)?;
     let mut satpoint_to_sequence_number = wtx.open_multimap_table(SATPOINT_TO_SEQUENCE_NUMBER)?;
     let mut sequence_number_to_children = wtx.open_multimap_table(SEQUENCE_NUMBER_TO_CHILDREN)?;
@@ -433,6 +444,7 @@ impl<'index> Updater<'_> {
       id_to_sequence_number: &mut inscription_id_to_sequence_number,
       index_transactions: self.index.index_transactions,
       inscription_number_to_sequence_number: &mut inscription_number_to_sequence_number,
+      id_to_txcnt: &mut inscription_id_to_txcnt,
       lost_sats,
       next_sequence_number,
       outpoint_to_value: &mut outpoint_to_value,
@@ -448,6 +460,7 @@ impl<'index> Updater<'_> {
       unbound_inscriptions,
       value_cache,
       value_receiver,
+      first_in_block: true,
     };
 
     if self.index.index_sats {
@@ -544,6 +557,7 @@ impl<'index> Updater<'_> {
       for (tx, txid) in block.txdata.iter().skip(1).chain(block.txdata.first()) {
         inscription_updater.index_envelopes(tx, *txid, None)?;
       }
+      inscription_updater.end_block()?;
     }
 
     if index_inscriptions {
