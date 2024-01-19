@@ -6,6 +6,8 @@ use {
   tokio::sync::mpsc::{error::TryRecvError, Receiver, Sender},
 };
 
+use std::fs::File;
+
 mod inscription_updater;
 mod rune_updater;
 
@@ -319,6 +321,23 @@ impl<'index> Updater<'_> {
     block: BlockData,
     value_cache: &mut HashMap<OutPoint, u64>,
   ) -> Result<()> {
+    lazy_static! {
+      static ref RUNES_OUTPUT_BLOCKS: Mutex<Option<File>> = Mutex::new(None);
+    }
+    let mut runes_output_blocks = RUNES_OUTPUT_BLOCKS.lock().unwrap();
+    if runes_output_blocks.as_ref().is_none() {
+      let chain_folder: String = match self.index.options.chain() { 
+        Chain::Mainnet => String::from(""),
+        Chain::Testnet => String::from("testnet3/"),
+        Chain::Signet => String::from("signet/"),
+        Chain::Regtest => String::from("regtest/"),
+      };
+      *runes_output_blocks = Some(File::options().append(true).open(format!("{chain_folder}runes_output_blocks.txt")).unwrap());
+    }
+    println!("cmd;{0};new_block;{1}", self.height, &block.header.block_hash());
+    writeln!(runes_output_blocks.as_ref().unwrap(), "cmd;{0};new_block;{1}", self.height, &block.header.block_hash())?;
+    (runes_output_blocks.as_ref().unwrap()).flush()?;
+    
     Reorg::detect_reorg(&block, self.height, self.index)?;
 
     let start = Instant::now();
@@ -607,26 +626,14 @@ impl<'index> Updater<'_> {
         timestamp: block.header.time,
         transaction_id_to_rune: &mut transaction_id_to_rune,
         updates: HashMap::new(),
+        first_in_block: true,
+        chain: self.index.options.chain(),
       };
 
       for (i, (tx, txid)) in block.txdata.iter().enumerate() {
         rune_updater.index_runes(i, tx, *txid)?;
       }
-
-      for (rune_id, update) in rune_updater.updates {
-        let mut entry = RuneEntry::load(
-          rune_id_to_rune_entry
-            .get(&rune_id.store())?
-            .unwrap()
-            .value(),
-        );
-
-        entry.burned += update.burned;
-        entry.mints += update.mints;
-        entry.supply += update.supply;
-
-        rune_id_to_rune_entry.insert(&rune_id.store(), entry.store())?;
-      }
+      rune_updater.end_block()?;
     }
 
     height_to_block_header.insert(&self.height, &block.header.store())?;
