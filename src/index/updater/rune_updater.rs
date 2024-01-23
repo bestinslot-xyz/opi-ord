@@ -115,6 +115,7 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
 
     // A mapping of rune ID to un-allocated balance of that rune
     let mut unallocated: HashMap<u128, u128> = HashMap::new();
+    let mut tx_inputs: HashMap<OutPoint, Vec<(u128, u128)>> = HashMap::new(); // outpoint -> (id, amount)[]
 
     // Increment unallocated runes with the runes in this transaction's inputs
     for input in &tx.input {
@@ -131,6 +132,10 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
           let (balance, len) = varint::decode(&buffer[i..]);
           i += len;
           *unallocated.entry(id).or_default() += balance;
+          tx_inputs
+            .entry(input.previous_output)
+            .or_default()
+            .push((id, balance));
         }
         removed = true;
       }
@@ -139,6 +144,9 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
         self.write_to_file(format!("cmd;{0};outpoint_to_balances_remove;{1}", self.height, input.previous_output), false)?;
       }
     }
+    let mut new_rune_allocations: HashMap<OutPoint, Vec<(u128, u128)>> = HashMap::new(); // outpoint -> (id, amount)[]
+    let mut mints: HashMap<OutPoint, Vec<(u128, u128)>> = HashMap::new(); // outpoint -> (id, amount)[]
+    let mut transfers: HashMap<OutPoint, Vec<(u128, u128)>> = HashMap::new(); // outpoint -> (id, amount)[]
 
     let burn = runestone
       .as_ref()
@@ -266,24 +274,24 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
             continue;
           }
 
-          let (balance, id) = if id == 0 {
+          let (balance, id, output_type) = if id == 0 {
             // If this edict allocates new issuance runes, skip it
             // if no issuance was present, or if the issuance was invalid.
             // Additionally, replace ID 0 with the newly assigned ID, and
             // get the unallocated balance of the issuance.
             match allocation.as_mut() {
-              Some(Allocation { balance, id, .. }) => (balance, *id),
+              Some(Allocation { balance, id, .. }) => (balance, *id, 0),
               None => continue,
             }
           } else if let Some(claim) = claim(id) {
             match mintable.get_mut(&claim) {
-              Some(balance) => (balance, claim),
+              Some(balance) => (balance, claim, 1),
               None => continue,
             }
           } else {
             // Get the unallocated balance of the given ID
             match unallocated.get_mut(&id) {
-              Some(balance) => (balance, id),
+              Some(balance) => (balance, id, 2),
               None => continue,
             }
           };
@@ -292,6 +300,35 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
             if amount > 0 {
               *balance -= amount;
               *allocated[output].entry(id).or_default() += amount;
+            }
+          };
+          let mut save_to_maps = |output: usize, amount: u128| {
+            let outpoint = OutPoint {
+              txid,
+              vout: u32::try_from(output).unwrap(),
+            };
+            
+            if output_type == 0 {
+              // if outpoint already in new_rune_allocations, check ids and if match found, add amount to existing amount
+              if let Some((_, amt)) = new_rune_allocations.get_mut(&outpoint).and_then(|v| v.iter_mut().find(|(id_, _)| *id_ == id)) {
+                *amt += amount;
+              } else {
+                new_rune_allocations.entry(outpoint).or_default().push((id, amount));
+              }
+            } else if output_type == 1 {
+              // if outpoint already in mints, check ids and if match found, add amount to existing amount
+              if let Some((_, amt)) = mints.get_mut(&outpoint).and_then(|v| v.iter_mut().find(|(id_, _)| *id_ == id)) {
+                *amt += amount;
+              } else {
+                mints.entry(outpoint).or_default().push((id, amount));
+              }
+            } else if output_type == 2 {
+              // if outpoint already in transfers, check ids and if match found, add amount to existing amount
+              if let Some((_, amt)) = transfers.get_mut(&outpoint).and_then(|v| v.iter_mut().find(|(id_, _)| *id_ == id)) {
+                *amt += amount;
+              } else {
+                transfers.entry(outpoint).or_default().push((id, amount));
+              }
             }
           };
 
@@ -312,16 +349,21 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
               let remainder = usize::try_from(*balance % destinations.len() as u128).unwrap();
 
               for (i, output) in destinations.iter().enumerate() {
+                let amt = if i < remainder { amount + 1 } else { amount };
                 allocate(
                   balance,
-                  if i < remainder { amount + 1 } else { amount },
+                  amt,
                   *output,
                 );
+
+                save_to_maps(*output, amt);
               }
             } else {
               // if amount is non-zero, distribute amount to eligible outputs
               for output in destinations {
-                allocate(balance, amount.min(*balance), output);
+                let amt = amount.min(*balance);
+                allocate(balance, amt, output);
+                save_to_maps(output, amt);
               }
             }
           } else {
@@ -333,6 +375,7 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
             };
 
             allocate(balance, amount, output);
+            save_to_maps(output, amount);
           }
         }
 
@@ -422,7 +465,7 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
       }
     }
 
-    let mut burned: HashMap<u128, u128> = HashMap::new();
+    let mut burned: HashMap<u128, u128> = HashMap::new(); // NOTE: use this for tracking burns
 
     if burn {
       for (id, balance) in unallocated {
@@ -445,6 +488,16 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
         for (id, balance) in unallocated {
           if balance > 0 {
             *allocated[vout].entry(id).or_default() += balance;
+
+            let outpoint = OutPoint {
+              txid,
+              vout: vout.try_into().unwrap(),
+            };
+            if let Some((_, amt)) = transfers.get_mut(&outpoint).and_then(|v| v.iter_mut().find(|(id_, _)| *id_ == id)) {
+              *amt += balance;
+            } else {
+              transfers.entry(outpoint).or_default().push((id, balance));
+            }
           }
         }
       } else {
@@ -498,13 +551,52 @@ impl<'a, 'db, 'tx> RuneUpdater<'a, 'db, 'tx> {
       self.write_to_file(format!("cmd;{0};outpoint_to_balances_insert;{1};{2};{3}", self.height, scriptpubkeyhex, outpoint, balances_str), false)?;
     }
 
+    // use tx_inputs, new_rune_allocations, mints, transfers, and burned to get event string
+    // cmd;<height>;tx_events_input;<txid>;<outpoint>;<id>;<amount>
+    // cmd;<height>;tx_events_new_rune_allocation;<txid>;<outpoint>;<id>;<amount>
+    // cmd;<height>;tx_events_mint;<txid>;<outpoint>;<id>;<amount>
+    // cmd;<height>;tx_events_transfer;<txid>;<outpoint>;<id>;<amount>
+    // cmd;<height>;tx_events_burn;<txid>;<id>;<amount>
+    for (outpoint, balances) in tx_inputs {
+      for (id, amount) in balances {
+        let rune_id = RuneId::try_from(id).unwrap();
+        self.write_to_file(format!("cmd;{0};tx_events_input;{1};{2};{3};{4}", self.height, txid, outpoint, rune_id, amount), false)?;
+      }
+    }
+    for (outpoint, balances) in new_rune_allocations {
+      for (id, amount) in balances {
+        let rune_id = RuneId::try_from(id).unwrap();
+        let vout = usize::try_from(outpoint.vout).unwrap();
+        let scriptpubkeyhex = hex::encode(tx.output[vout].script_pubkey.clone().into_bytes());
+        self.write_to_file(format!("cmd;{0};tx_events_new_rune_allocation;{1};{2};{3};{4};{5}", self.height, txid, outpoint, rune_id, amount, scriptpubkeyhex), false)?;
+      }
+    }
+    for (outpoint, balances) in mints {
+      for (id, amount) in balances {
+        let rune_id = RuneId::try_from(id).unwrap();
+        let vout = usize::try_from(outpoint.vout).unwrap();
+        let scriptpubkeyhex = hex::encode(tx.output[vout].script_pubkey.clone().into_bytes());
+        self.write_to_file(format!("cmd;{0};tx_events_mint;{1};{2};{3};{4};{5}", self.height, txid, outpoint, rune_id, amount, scriptpubkeyhex), false)?;
+      }
+    }
+    for (outpoint, balances) in transfers {
+      for (id, amount) in balances {
+        let rune_id = RuneId::try_from(id).unwrap();
+        let vout = usize::try_from(outpoint.vout).unwrap();
+        let scriptpubkeyhex = hex::encode(tx.output[vout].script_pubkey.clone().into_bytes());
+        self.write_to_file(format!("cmd;{0};tx_events_transfer;{1};{2};{3};{4};{5}", self.height, txid, outpoint, rune_id, amount, scriptpubkeyhex), false)?;
+      }
+    }
+
     // increment entries with burned runes
     for (id, amount) in burned {
+      let rune_id = RuneId::try_from(id).unwrap();
       self
         .updates
-        .entry(RuneId::try_from(id).unwrap())
+        .entry(rune_id)
         .or_default()
         .burned += amount;
+      self.write_to_file(format!("cmd;{0};tx_events_burn;{1};{2};{3}", self.height, txid, rune_id, amount), false)?;
     }
 
     Ok(())
