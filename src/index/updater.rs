@@ -6,6 +6,8 @@ use {
   tokio::sync::mpsc::{error::TryRecvError, Receiver, Sender},
 };
 
+use std::fs::File;
+
 mod inscription_updater;
 mod rune_updater;
 
@@ -71,7 +73,7 @@ impl<'index> Updater<'index> {
       Some(progress_bar)
     };
 
-    let rx = Self::fetch_blocks_from(self.index, self.height, self.index.index_sats)?;
+    let rx = self.fetch_blocks_from(self.index, self.height, self.index.index_sats)?;
 
     let (mut outpoint_sender, mut value_receiver) = Self::spawn_fetcher(&self.index.settings)?;
 
@@ -151,6 +153,7 @@ impl<'index> Updater<'index> {
   }
 
   fn fetch_blocks_from(
+    &self,
     index: &Index,
     mut height: u32,
     index_sats: bool,
@@ -161,7 +164,10 @@ impl<'index> Updater<'index> {
 
     let client = index.settings.bitcoin_rpc_client(None)?;
 
-    let first_inscription_height = index.first_inscription_height;
+    let mut first_inscription_height = index.first_inscription_height;
+    if !self.index.settings.index_inscriptions() && self.index.index_runes {
+      first_inscription_height = self.index.settings.first_rune_height();
+    }
 
     thread::spawn(move || loop {
       if let Some(height_limit) = height_limit {
@@ -312,6 +318,23 @@ impl<'index> Updater<'index> {
     block: BlockData,
     value_cache: &mut HashMap<OutPoint, u64>,
   ) -> Result<()> {
+    lazy_static! {
+      static ref RUNES_OUTPUT_BLOCKS: Mutex<Option<File>> = Mutex::new(None);
+    }
+    let mut runes_output_blocks = RUNES_OUTPUT_BLOCKS.lock().unwrap();
+    if runes_output_blocks.as_ref().is_none() {
+      let chain_folder: String = match self.index.settings.chain() { 
+        Chain::Mainnet => String::from(""),
+        Chain::Testnet => String::from("testnet3/"),
+        Chain::Signet => String::from("signet/"),
+        Chain::Regtest => String::from("regtest/"),
+      };
+      *runes_output_blocks = Some(File::options().append(true).open(format!("{chain_folder}runes_output_blocks.txt")).unwrap());
+    }
+    println!("cmd;{0};new_block;{1}", self.height, &block.header.block_hash());
+    writeln!(runes_output_blocks.as_ref().unwrap(), "cmd;{0};new_block;{1}", self.height, &block.header.block_hash())?;
+    (runes_output_blocks.as_ref().unwrap()).flush()?;
+
     Reorg::detect_reorg(&block, self.height, self.index)?;
 
     let start = Instant::now();
@@ -593,6 +616,7 @@ impl<'index> Updater<'index> {
       let mut rune_updater = RuneUpdater {
         block_time: block.header.time,
         burned: HashMap::new(),
+        minted: HashMap::new(),
         client: &self.index.client,
         height: self.height,
         id_to_entry: &mut rune_id_to_rune_entry,
@@ -607,6 +631,8 @@ impl<'index> Updater<'index> {
         sequence_number_to_rune_id: &mut sequence_number_to_rune_id,
         statistic_to_count: &mut statistic_to_count,
         transaction_id_to_rune: &mut transaction_id_to_rune,
+        first_in_block: true,
+        chain: self.index.settings.chain(),
       };
 
       for (i, (tx, txid)) in block.txdata.iter().enumerate() {
